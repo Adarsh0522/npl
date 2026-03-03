@@ -1,0 +1,78 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isOrganizer() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'organizer';
+    }
+    
+    function isOwner() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'owner';
+    }
+
+    // 1. Users Collection
+    match /users/{userId} {
+      // Anyone logged in can read (for owner dropdowns, etc)
+      allow read: if isAuthenticated();
+      // Only Organizer can manage users
+      allow write: if isOrganizer();
+    }
+
+    // 2. Teams Collection
+    match /teams/{teamId} {
+      // Public needs to read teams for the /teams page
+      allow read: if true;
+      // Transactions for bids require Owner to read, which is covered by true
+      // Only Organizer can manage teams natively. 
+      // Note: Force assign and auto sold logic are Organizer writes.
+      // Owner transaction logic modifies Team wallet, which actually requires update access!
+      
+      // Wait: UseBidTransaction directly updates team wallet? NO, the prompt says:
+      // "Owner Write only bids (through transaction updates on settings/auction)"
+      // Ah. If Owner bids, the transaction DOES NOT update the team wallet until SOLD.
+      // But useBidTransaction in Phase 1 did: `teamDoc = await transaction.get(teamRef)`. It ONLY reads.
+      // When auto sold (timer end), Organizer's transaction updates the wallet!
+      // So Owner only reads the team.
+      allow write: if isOrganizer();
+    }
+
+    // 3. Players Collection
+    match /players/{playerId} {
+      // Public needs to see players list
+      allow read: if true;
+      // Only Organizer can create/update players (including Force Assign and Auto Sold)
+      allow write: if isOrganizer();
+    }
+
+    // 4. Settings Collection (Auction logic)
+    match /settings/{document} {
+      // Public needs to read live auction status
+      allow read: if true;
+      
+      // Organizer has full control
+      // Owner can ONLY update the `auction` doc, and ONLY specific fields during a bid.
+      allow update: if isOrganizer() || (
+        isOwner() && 
+        document == 'auction' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['currentBid', 'leadingTeamId', 'timerSeconds'])
+      );
+      
+      allow create, delete: if isOrganizer();
+    }
+
+    // Default deny wrapper
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
