@@ -17,7 +17,7 @@ export const BidHistory = ({ bidHistory = [] }) => {
         );
     }
 
-    const sorted = [...bidHistory].sort((a, b) => (b.amount || 0) - (a.amount || 0));
+    const sorted = [...bidHistory].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
     return (
         <div className="mt-2">
@@ -32,7 +32,7 @@ export const BidHistory = ({ bidHistory = [] }) => {
 
             {/* Desktop: always visible, scrollable. Mobile: collapsible */}
             <div className={`${expanded ? 'block' : 'hidden'} md:block`}>
-                <div className="max-h-[160px] overflow-y-auto custom-scrollbar mt-1 bg-gray-900/60 rounded border border-gray-800">
+                <div className="max-h-[200px] overflow-y-auto custom-scrollbar mt-1 bg-gray-900/60 rounded border border-gray-800">
                     <table className="w-full text-xs">
                         <thead className="sticky top-0 bg-gray-900 z-10">
                             <tr className="border-b border-gray-800">

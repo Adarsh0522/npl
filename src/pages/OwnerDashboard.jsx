@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { doc, collection, query, where, onSnapshot } from 'firebase/firestore';
 import { db } from '../firebase';
 import { useAuth } from '../context/AuthContext';
@@ -9,6 +9,8 @@ import { LiveBidButton } from '../components/owner/LiveBidButton';
 import { Wallet, Users, AlertCircle, Download, Trophy, Clock } from 'lucide-react';
 import PlayerCard from '../components/PlayerCard';
 import { AuctionTabs } from '../components/AuctionTabs';
+import SoldAnnouncement from '../components/announcements/SoldAnnouncement';
+import UnsoldAnnouncement from '../components/announcements/UnsoldAnnouncement';
 
 const formatTime = (seconds) => {
     if (seconds == null || isNaN(seconds) || seconds < 0) return "00:00";
@@ -27,6 +29,12 @@ export default function OwnerDashboard() {
     const [livePlayer, setLivePlayer] = useState(null);
     const [teams, setTeams] = useState([]);
     const [loading, setLoading] = useState(true);
+
+    // Congratulations & Outbid state
+    const [congratsMessage, setCongratsMessage] = useState(null);
+    const [outbidMessage, setOutbidMessage] = useState(false);
+    const prevSquadIdsRef = useRef(new Set());
+    const prevLeadingTeamRef = useRef(null);
 
     useEffect(() => {
         if (!userTeamId) {
@@ -50,14 +58,21 @@ export default function OwnerDashboard() {
             setLoading(false);
         });
 
-        const qLive = query(playersRef, where('status', '==', 'LIVE'));
-        const unsubscribeLive = onSnapshot(qLive, (snapshot) => {
-            if (!snapshot.empty) {
-                setLivePlayer({ id: snapshot.docs[0].id, ...snapshot.docs[0].data() });
+        // Subscribe to current/live player via currentPlayerId (works during ANNOUNCING too)
+        const unsubscribeLive = (() => {
+            if (auctionState?.currentPlayerId && (auctionState?.status === 'LIVE' || auctionState?.status === 'ANNOUNCING')) {
+                return onSnapshot(doc(db, 'players', auctionState.currentPlayerId), (docSnap) => {
+                    if (docSnap.exists()) {
+                        setLivePlayer({ id: docSnap.id, ...docSnap.data() });
+                    } else {
+                        setLivePlayer(null);
+                    }
+                });
             } else {
                 setLivePlayer(null);
+                return () => { };
             }
-        });
+        })();
 
         const unsubscribeTeams = onSnapshot(collection(db, 'teams'), (snap) => {
             setTeams(snap.docs.map(d => ({ id: d.id, ...d.data() })));
@@ -69,7 +84,45 @@ export default function OwnerDashboard() {
             unsubscribeLive();
             unsubscribeTeams();
         };
-    }, [userTeamId]);
+    }, [userTeamId, auctionState?.currentPlayerId, auctionState?.status]);
+
+    // Congratulations banner: detect new player added to squad
+    useEffect(() => {
+        if (squad.length === 0) {
+            prevSquadIdsRef.current = new Set();
+            return;
+        }
+
+        const currentIds = new Set(squad.map(p => p.id));
+        const prevIds = prevSquadIdsRef.current;
+
+        // Only trigger if prevIds was not empty (skip initial load)
+        if (prevIds.size > 0) {
+            for (const player of squad) {
+                if (!prevIds.has(player.id)) {
+                    setCongratsMessage(`🎉 Congratulations! You won ${player.name} for ₹${(Number(player.soldPrice) || 0).toLocaleString()}`);
+                    setTimeout(() => setCongratsMessage(null), 4000);
+                    break;
+                }
+            }
+        }
+
+        prevSquadIdsRef.current = currentIds;
+    }, [squad]);
+
+    // Outbid toast: detect when leading team changes away from userTeamId
+    useEffect(() => {
+        const currentLeader = auctionState?.leadingTeamId || null;
+        const prevLeader = prevLeadingTeamRef.current;
+
+        // If we WERE leading (prevLeader === userTeamId) and now someone else is
+        if (prevLeader === userTeamId && currentLeader && currentLeader !== userTeamId) {
+            setOutbidMessage(true);
+            setTimeout(() => setOutbidMessage(false), 3000);
+        }
+
+        prevLeadingTeamRef.current = currentLeader;
+    }, [auctionState?.leadingTeamId, userTeamId]);
 
     const handleExportTeam = () => {
         if (!teamData || squad.length === 0) {
@@ -150,9 +203,34 @@ export default function OwnerDashboard() {
         : null;
     const isMyTeamLeading = auctionState?.leadingTeamId === userTeamId;
 
+    // Announcement state: show when ANNOUNCING OR when player matches last resolved
+    const isShowingAnnouncement = auctionState?.status === 'ANNOUNCING'
+        || (auctionState?.currentPlayerId
+            && auctionState?.lastResolvedPlayerId
+            && auctionState.currentPlayerId === auctionState.lastResolvedPlayerId);
+    const announcementStatus = auctionState?.lastResolvedStatus;
+
     return (
         <div className="min-h-screen bg-brand-darker text-white p-4 sm:p-6 pb-24 lg:pb-6 relative overflow-hidden">
             <div className="absolute top-20 right-20 w-64 h-64 bg-brand-neon/5 rounded-full blur-[100px] pointer-events-none"></div>
+
+            {/* Congratulations Banner */}
+            {congratsMessage && (
+                <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 animate-[fadeIn_0.3s_ease-out]">
+                    <div className="bg-green-500/20 border border-green-500/40 text-green-400 px-6 py-3 rounded-xl font-bold text-sm uppercase tracking-wider shadow-2xl backdrop-blur-sm">
+                        {congratsMessage}
+                    </div>
+                </div>
+            )}
+
+            {/* Outbid Toast */}
+            {outbidMessage && (
+                <div className="fixed top-4 right-4 z-50 animate-[fadeIn_0.3s_ease-out]">
+                    <div className="bg-red-500/20 border border-red-500/40 text-red-400 px-5 py-2.5 rounded-lg font-bold text-sm uppercase tracking-wider shadow-2xl backdrop-blur-sm">
+                        ⚠️ You have been outbid!
+                    </div>
+                </div>
+            )}
 
             <div className="max-w-7xl mx-auto space-y-6 relative z-10">
                 <header className="border-b border-gray-800 pb-6 mb-8 flex flex-col md:flex-row md:items-end justify-between">
@@ -260,7 +338,23 @@ export default function OwnerDashboard() {
                                 )}
                             </div>
 
-                            {isLive ? (
+                            {isShowingAnnouncement ? (
+                                <div className="mb-8">
+                                    {announcementStatus === 'SOLD' ? (
+                                        <SoldAnnouncement
+                                            playerName={livePlayer?.name}
+                                            soldPrice={auctionState?.currentBid}
+                                            teamName={teams.find(t => t.id === auctionState?.leadingTeamId)?.name}
+                                            bidHistory={livePlayer?.bidHistory || []}
+                                        />
+                                    ) : (
+                                        <UnsoldAnnouncement
+                                            playerName={livePlayer?.name}
+                                            basePrice={livePlayer?.basePrice}
+                                        />
+                                    )}
+                                </div>
+                            ) : isLive ? (
                                 <div className="mb-8">
                                     <div className="max-w-xs mx-auto">
                                         <PlayerCard player={livePlayer} showStatus={false} isLiveView={true} />

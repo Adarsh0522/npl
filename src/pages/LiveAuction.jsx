@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { doc, collection, onSnapshot } from 'firebase/firestore';
+import { doc, collection, onSnapshot, setDoc, deleteDoc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../firebase';
 import { useAuction } from '../context/AuctionContext';
 import { useAuctionTimer } from '../hooks/useAuctionTimer';
@@ -7,6 +7,8 @@ import { useAuctionResolver } from '../hooks/useAuctionResolver';
 import { Trophy, Clock } from 'lucide-react';
 import PlayerCard from '../components/PlayerCard';
 import { AuctionTabs } from '../components/AuctionTabs';
+import SoldAnnouncement from '../components/announcements/SoldAnnouncement';
+import UnsoldAnnouncement from '../components/announcements/UnsoldAnnouncement';
 
 const formatTime = (seconds) => {
     if (seconds == null || isNaN(seconds) || seconds < 0) return "00:00";
@@ -22,10 +24,42 @@ export default function LiveAuction() {
     const [playerInfo, setPlayerInfo] = useState(null);
     const [leadingTeam, setLeadingTeam] = useState(null);
     const [teams, setTeams] = useState([]);
+    const [liveUserCount, setLiveUserCount] = useState(0);
+
+    // Live Viewer Count (Presence System)
+    useEffect(() => {
+        const sessionId = crypto.randomUUID();
+        const presenceRef = doc(db, "auctionPresence", sessionId);
+
+        // 1. Add document on mount
+        setDoc(presenceRef, {
+            joinedAt: serverTimestamp(),
+            lastActiveAt: serverTimestamp()
+        }).catch(err => console.error("Presence error:", err));
+
+        // 2. Heartbeat every 15 seconds
+        const heartbeat = setInterval(() => {
+            updateDoc(presenceRef, {
+                lastActiveAt: serverTimestamp()
+            }).catch(err => console.error("Heartbeat error:", err));
+        }, 15000);
+
+        // 3. Listen to live users
+        const unsubPresence = onSnapshot(collection(db, "auctionPresence"), (snap) => {
+            setLiveUserCount(snap.size);
+        });
+
+        // 4. Cleanup on unmount
+        return () => {
+            clearInterval(heartbeat);
+            unsubPresence();
+            deleteDoc(presenceRef).catch(err => console.error("Cleanup error:", err));
+        };
+    }, []);
 
     // Subscribe to current player via onSnapshot (real-time)
     useEffect(() => {
-        if (auctionState?.currentPlayerId && auctionState?.status === 'LIVE') {
+        if (auctionState?.currentPlayerId && (auctionState?.status === 'LIVE' || auctionState?.status === 'ANNOUNCING')) {
             const unsub = onSnapshot(doc(db, 'players', auctionState.currentPlayerId), (docSnap) => {
                 if (docSnap.exists()) {
                     setPlayerInfo({ id: docSnap.id, ...docSnap.data() });
@@ -70,12 +104,40 @@ export default function LiveAuction() {
     const isLive = auctionState?.status === 'LIVE' && playerInfo;
     const currentBid = auctionState?.currentBid || auctionState?.basePrice || playerInfo?.basePrice || 1000;
 
+    // Announcement state: show when ANNOUNCING OR when player matches last resolved
+    const isShowingAnnouncement = auctionState?.status === 'ANNOUNCING'
+        || (auctionState?.currentPlayerId
+            && auctionState?.lastResolvedPlayerId
+            && auctionState.currentPlayerId === auctionState.lastResolvedPlayerId);
+    const announcementStatus = auctionState?.lastResolvedStatus; // 'SOLD' or 'UNSOLD'
+
     return (
         <div className="min-h-screen bg-brand-darker text-white p-4 sm:p-6 lg:p-8 flex flex-col items-center justify-start overflow-hidden relative">
             <div className="absolute top-1/4 left-1/4 w-[500px] h-[500px] bg-brand-neon/10 rounded-full blur-[120px] pointer-events-none mix-blend-screen"></div>
             <div className="absolute bottom-0 right-0 w-[400px] h-[400px] bg-brand-accent/10 rounded-full blur-[100px] pointer-events-none mix-blend-screen"></div>
 
-            {!isLive ? (
+
+
+            {isShowingAnnouncement ? (
+                /* Announcement overlay — SOLD or UNSOLD */
+                <div className="flex-1 flex flex-col items-center justify-center text-center z-10 w-full min-h-[60vh]">
+                    <div className="w-full max-w-2xl mx-auto bg-brand-dark rounded-2xl border border-gray-800 shadow-2xl overflow-hidden">
+                        {announcementStatus === 'SOLD' ? (
+                            <SoldAnnouncement
+                                playerName={playerInfo?.name}
+                                soldPrice={auctionState?.currentBid}
+                                teamName={teams.find(t => t.id === auctionState?.leadingTeamId)?.name}
+                                bidHistory={playerInfo?.bidHistory || []}
+                            />
+                        ) : (
+                            <UnsoldAnnouncement
+                                playerName={playerInfo?.name}
+                                basePrice={playerInfo?.basePrice}
+                            />
+                        )}
+                    </div>
+                </div>
+            ) : !isLive ? (
                 <div className="flex-1 flex flex-col items-center justify-center text-center z-10 w-full h-full min-h-[60vh]">
                     <Trophy size={80} className={`mb-6 ${auctionState?.status === 'PAUSED' ? 'text-yellow-500' : 'text-gray-600'} mx-auto`} />
                     <h1 className="text-5xl md:text-7xl font-black uppercase tracking-tighter text-white mb-4">
@@ -92,8 +154,9 @@ export default function LiveAuction() {
 
                     {/* Left: Player Card */}
                     <div className="flex-1 flex flex-col items-center relative w-full lg:w-1/2">
-                        <div className="w-full max-w-md transform scale-110 lg:scale-100 origin-top">
+                        <div className="w-full max-w-md">
                             <PlayerCard
+                                key={auctionState?.currentPlayerId || 'empty'}
                                 player={playerInfo}
                                 showStatus={false}
                                 showBasePrice={true}
@@ -140,7 +203,7 @@ export default function LiveAuction() {
                                             <Trophy size={20} className="text-brand-neon" />
                                         </div>
                                     )}
-                                    <h2 className="text-3xl sm:text-4xl font-black text-brand-neon uppercase tracking-tight truncate">{leadingTeam.name}</h2>
+                                    <h2 className="text-3xl sm:text-4xl font-black text-brand-neon uppercase tracking-tight text-wrap-fix clamp-2">{leadingTeam.name}</h2>
                                 </div>
                             ) : (
                                 <div className="flex items-center text-gray-600 space-x-3">

@@ -34,7 +34,7 @@ export const AuctionTabs = ({ ownerTeamId = null, teams = [] }) => {
         return () => unsub();
     }, []);
 
-    const upcoming = allPlayers.filter(p => p.status === 'UPCOMING');
+    const upcoming = allPlayers.filter(p => p.status === 'READY');
     const sold = allPlayers.filter(p => p.status === 'SOLD');
     const unsold = allPlayers.filter(p => p.status === 'UNSOLD');
 
@@ -62,12 +62,12 @@ export const AuctionTabs = ({ ownerTeamId = null, teams = [] }) => {
                         key={tab.id}
                         onClick={() => setActiveTab(tab.id)}
                         className={`flex-shrink-0 px-4 py-2.5 font-bold text-xs uppercase tracking-widest border-b-2 transition-all whitespace-nowrap ${activeTab === tab.id
-                                ? tab.id === 'sold'
-                                    ? 'border-green-500 text-green-400'
-                                    : tab.id === 'unsold'
-                                        ? 'border-red-500 text-red-400'
-                                        : 'border-brand-neon text-brand-neon'
-                                : 'border-transparent text-gray-500 hover:text-gray-300'
+                            ? tab.id === 'sold'
+                                ? 'border-green-500 text-green-400'
+                                : tab.id === 'unsold'
+                                    ? 'border-red-500 text-red-400'
+                                    : 'border-brand-neon text-brand-neon'
+                            : 'border-transparent text-gray-500 hover:text-gray-300'
                             }`}
                     >
                         {tab.label}
@@ -165,12 +165,12 @@ const CompactPlayerCard = ({ player, variant = 'upcoming' }) => {
 
             {/* Info */}
             <div className="flex-1 min-w-0">
-                <p className="font-bold text-white text-sm uppercase tracking-tight truncate">{player.name}</p>
+                <p className="font-bold text-white text-sm uppercase tracking-tight text-wrap-fix clamp-2">{player.name}</p>
                 <p className={`text-[10px] font-bold uppercase tracking-widest ${player.playingRole === 'Batsman' ? 'text-blue-400' :
-                        player.playingRole === 'Bowler' ? 'text-red-400' :
-                            (player.playingRole === 'Allrounder' || player.playingRole === 'All Rounder') ? 'text-purple-400' :
-                                (player.playingRole === 'Wicket Keeper' || player.playingRole === 'Wicketkeeper') ? 'text-green-400' :
-                                    'text-gray-400'
+                    player.playingRole === 'Bowler' ? 'text-red-400' :
+                        (player.playingRole === 'Allrounder' || player.playingRole === 'All Rounder') ? 'text-purple-400' :
+                            (player.playingRole === 'Wicket Keeper' || player.playingRole === 'Wicketkeeper') ? 'text-green-400' :
+                                'text-gray-400'
                     }`}>
                     {player.playingRole || 'Player'}
                 </p>
@@ -195,8 +195,8 @@ const SoldPlayerCard = ({ player, teamName, isMyTeam = false }) => {
 
     return (
         <div className={`p-3 rounded-lg border transition ${isMyTeam
-                ? 'bg-brand-neon/5 border-brand-neon/20'
-                : 'bg-brand-dark border-gray-800'
+            ? 'bg-brand-neon/5 border-brand-neon/20'
+            : 'bg-brand-dark border-gray-800'
             }`}>
             <div className="flex items-center gap-3">
                 {/* Photo */}
@@ -210,17 +210,17 @@ const SoldPlayerCard = ({ player, teamName, isMyTeam = false }) => {
 
                 {/* Info */}
                 <div className="flex-1 min-w-0">
-                    <p className="font-bold text-white text-sm uppercase tracking-tight truncate">{player.name}</p>
+                    <p className="font-bold text-white text-sm uppercase tracking-tight text-wrap-fix clamp-2">{player.name}</p>
                     <div className="flex items-center gap-2 mt-0.5">
                         <span className={`text-[10px] font-bold uppercase tracking-widest ${player.playingRole === 'Batsman' ? 'text-blue-400' :
-                                player.playingRole === 'Bowler' ? 'text-red-400' :
-                                    (player.playingRole === 'Allrounder' || player.playingRole === 'All Rounder') ? 'text-purple-400' :
-                                        'text-gray-400'
+                            player.playingRole === 'Bowler' ? 'text-red-400' :
+                                (player.playingRole === 'Allrounder' || player.playingRole === 'All Rounder') ? 'text-purple-400' :
+                                    'text-gray-400'
                             }`}>
                             {player.playingRole || 'Player'}
                         </span>
                         <span className="text-gray-600">•</span>
-                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest truncate">{teamName}</span>
+                        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest text-wrap-fix">{teamName}</span>
                     </div>
                 </div>
 

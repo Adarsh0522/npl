@@ -37,7 +37,7 @@ export default function PlayerCard({ player, showStatus = true, showBasePrice = 
                                 <p className="text-lg font-black text-white m-0 leading-none drop-shadow-md">₹{Number(player.soldPrice).toLocaleString()}</p>
                             )}
                             {player.teamId && teamName && (
-                                <p className="text-xs font-bold text-gray-200 mt-1 uppercase truncate max-w-[140px] leading-none drop-shadow-md">Team: {teamName}</p>
+                                <p className="text-xs font-bold text-gray-200 mt-1 uppercase max-w-[140px] leading-none drop-shadow-md text-wrap-fix">Team: {teamName}</p>
                             )}
                         </div>
                     </div>
@@ -52,19 +52,23 @@ export default function PlayerCard({ player, showStatus = true, showBasePrice = 
                     </div>
                 )}
 
-                {player.photoUrl || player.imageUrl ? (
-                    <img
-                        src={formatDriveImage(player.photoUrl || player.imageUrl)}
-                        alt={player.name}
-                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500 z-10"
-                        onError={(e) => {
-                            e.target.style.display = 'none';
-                            if (e.target.nextElementSibling) {
-                                e.target.nextElementSibling.style.display = 'flex';
-                            }
-                        }}
-                    />
-                ) : null}
+                {player.photoUrl || player.imageUrl ? (() => {
+                    const imgUrl = formatDriveImage(player.photoUrl || player.imageUrl);
+                    const srcWithCacheBust = imgUrl ? `${imgUrl}${imgUrl.includes('?') ? '&' : '?'}t=${player.id}` : '';
+                    return (
+                        <img
+                            src={srcWithCacheBust}
+                            alt={player.name}
+                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500 z-10"
+                            onError={(e) => {
+                                e.target.style.display = 'none';
+                                if (e.target.nextElementSibling) {
+                                    e.target.nextElementSibling.style.display = 'flex';
+                                }
+                            }}
+                        />
+                    );
+                })() : null}
 
                 <div className={`w-full h-full items-center justify-center absolute top-0 left-0 bg-gray-900 ${player.photoUrl || player.imageUrl ? 'hidden' : 'flex'} z-0`}>
                     <User size={64} className="text-gray-800" />
@@ -81,7 +85,7 @@ export default function PlayerCard({ player, showStatus = true, showBasePrice = 
                         }`}>
                         {player.playingRole || player.role || 'Player'}
                     </p>
-                    <h3 className="text-xl font-black uppercase tracking-tighter leading-tight mb-3 break-words" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }} title={player.name}>{player.name}</h3>
+                    <h3 className="text-xl font-black uppercase tracking-tighter leading-tight mb-3 text-wrap-fix clamp-2" title={player.name}>{player.name}</h3>
 
                     <div className="grid grid-cols-2 gap-2 text-xs text-gray-400">
                         <div>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { doc, getDoc, updateDoc, collection, query, where, getDocs, limit, orderBy, onSnapshot, writeBatch, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, updateDoc, collection, query, where, getDocs, limit, orderBy, onSnapshot, writeBatch, serverTimestamp, runTransaction } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { useAuction } from '../../context/AuctionContext';
 import { useAuctionTimer } from '../../hooks/useAuctionTimer';
@@ -43,8 +43,6 @@ export const AuctionController = () => {
     const [allPlayers, setAllPlayers] = useState([]);
 
     // Modals
-    const [showDemoReset, setShowDemoReset] = useState(false);
-    const [showFullReset, setShowFullReset] = useState(false);
     const [showOverride, setShowOverride] = useState(false);
     const [showAssign, setShowAssign] = useState(false);
 
@@ -86,6 +84,7 @@ export const AuctionController = () => {
     const isLive = status === 'LIVE';
     const isPaused = status === 'PAUSED';
     const isEnded = status === 'ENDED';
+    const isResolvedWaiting = status === 'ANNOUNCING';
 
     const getRemainingPurse = (teamId) => {
         const team = teams.find(t => t.id === teamId);
@@ -116,7 +115,7 @@ export const AuctionController = () => {
                     if (docSnap.id === firstPlayer.id) {
                         batch.update(docSnap.ref, { status: 'LIVE' });
                     } else {
-                        batch.update(docSnap.ref, { status: 'UPCOMING' });
+                        batch.update(docSnap.ref, { status: 'READY' });
                     }
                 });
 
@@ -132,12 +131,34 @@ export const AuctionController = () => {
 
                 await batch.commit();
                 return;
+            } else if (newStatus === 'PAUSED' && isLive) {
+                // Pause logic
+                await runTransaction(db, async (transaction) => {
+                    const freshAuction = await transaction.get(auctionRef);
+                    if (!freshAuction.exists()) return;
+                    const freshData = freshAuction.data();
+
+                    if (freshData.status !== 'LIVE') return; // Strict guard
+
+                    transaction.update(auctionRef, { status: 'PAUSED' });
+                });
+                return;
             } else if (newStatus === 'LIVE' && isPaused) {
-                // Resume — reset timer with fresh server time
-                await updateDoc(auctionRef, {
-                    status: 'LIVE',
-                    timerStartedAt: serverTimestamp(),
-                    timerDuration: 30000
+                // Resume logic
+                await runTransaction(db, async (transaction) => {
+                    const freshAuction = await transaction.get(auctionRef);
+                    if (!freshAuction.exists()) return;
+                    const freshData = freshAuction.data();
+
+                    // strict resume safeguards
+                    if (freshData.status === 'ANNOUNCING') { return; }
+                    if (freshData.status !== 'PAUSED') return;
+                    if (!freshData.currentPlayerId) return;
+
+                    transaction.update(auctionRef, {
+                        status: 'LIVE',
+                        timerStartedAt: serverTimestamp() // Restart timer
+                    });
                 });
                 return;
             }
@@ -151,44 +172,83 @@ export const AuctionController = () => {
         setError('');
         let success = false;
         try {
-            const batch = writeBatch(db);
-
-            if (auctionState?.currentPlayerId) {
-                const currentDoc = await getDoc(doc(db, 'players', auctionState.currentPlayerId));
-                if (currentDoc.exists()) {
-                    const data = currentDoc.data();
-                    if (data.status === 'LIVE' && !data.teamId) {
-                        batch.update(doc(db, 'players', auctionState.currentPlayerId), { status: 'UNSOLD' });
-                    }
-                }
-            }
-
-            const qUp = query(collection(db, 'players'), where('status', '==', 'UPCOMING'), orderBy('createdAt', 'asc'), limit(1));
+            // Find next eligible player
+            const qUp = query(collection(db, 'players'), where('status', 'in', ['READY', 'UNSOLD']));
             const upSnap = await getDocs(qUp);
 
             if (!upSnap.empty) {
-                const nextDoc = upSnap.docs[0];
-                batch.update(doc(db, 'players', nextDoc.id), { status: 'LIVE' });
-                batch.update(auctionRef, {
-                    lastPlayerId: auctionState?.currentPlayerId || null,
-                    currentPlayerId: nextDoc.id,
-                    currentBid: nextDoc.data().basePrice || 0,
-                    leadingTeamId: null,
-                    resolvedForPlayer: null,
-                    timerStartedAt: serverTimestamp(),
-                    timerDuration: 30000,
-                    status: 'LIVE'
+                const players = upSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                const randomIndex = Math.floor(Math.random() * players.length);
+                const selectedPlayer = players[randomIndex];
+
+                await runTransaction(db, async (transaction) => {
+                    // --- ALL READS FIRST ---
+                    const freshAuctionSnap = await transaction.get(auctionRef);
+                    if (!freshAuctionSnap.exists()) return;
+                    const freshData = freshAuctionSnap.data();
+
+                    // Guard: allow advance from LIVE (manual skip), ANNOUNCING, or PAUSED
+                    if (freshData.status !== 'LIVE' && freshData.status !== 'ANNOUNCING' && freshData.status !== 'PAUSED') return;
+
+                    // If in ANNOUNCING, verify we haven't already advanced
+                    if (freshData.status === 'ANNOUNCING'
+                        && freshData.currentPlayerId !== freshData.lastResolvedPlayerId) return;
+
+                    const playerRef = doc(db, 'players', selectedPlayer.id);
+                    const freshPlayerSnap = await transaction.get(playerRef);
+                    const freshPlayer = freshPlayerSnap.exists() ? freshPlayerSnap.data() : selectedPlayer;
+
+                    let currentPlayerSnap = null;
+                    let currentPlayerRef = null;
+                    // If current player is still LIVE (manual skip), read to mark UNSOLD
+                    if (freshData.currentPlayerId && freshData.status === 'LIVE') {
+                        currentPlayerRef = doc(db, 'players', freshData.currentPlayerId);
+                        currentPlayerSnap = await transaction.get(currentPlayerRef);
+                    }
+
+                    // --- READS COMPLETE, COMMENCE WRITES ---
+                    if (freshPlayer.status === 'SOLD') return; // Strict guard against sold re-entry
+
+                    if (currentPlayerSnap && currentPlayerSnap.exists()) {
+                        const data = currentPlayerSnap.data();
+                        if (data.status === 'LIVE' && !data.teamId) {
+                            transaction.update(currentPlayerRef, { status: 'UNSOLD' });
+                        }
+                    }
+
+                    transaction.update(playerRef, { status: 'LIVE' });
+                    transaction.update(auctionRef, {
+                        currentPlayerId: selectedPlayer.id,
+                        currentBid: freshPlayer.basePrice || 0,
+                        leadingTeamId: null,
+                        timerStartedAt: serverTimestamp(),
+                        status: 'LIVE',
+                        // Clear announcement fields
+                        nextPlayerScheduledAt: null,
+                        lastResolvedPlayerId: null,
+                        lastResolvedStatus: null
+                    });
                 });
-                await batch.commit();
                 success = true;
             } else {
-                batch.update(auctionRef, {
-                    status: 'ENDED',
-                    currentPlayerId: null,
-                    leadingTeamId: null,
-                    currentBid: 0
+                await runTransaction(db, async (transaction) => {
+                    const freshAuction = await transaction.get(auctionRef);
+                    if (!freshAuction.exists()) return;
+                    const freshData = freshAuction.data();
+
+                    if (freshData.status !== 'LIVE' && freshData.status !== 'ANNOUNCING' && freshData.status !== 'PAUSED') return;
+
+                    transaction.update(auctionRef, {
+                        status: 'ENDED',
+                        currentPlayerId: null,
+                        timerStartedAt: null,
+                        leadingTeamId: null,
+                        currentBid: 0,
+                        nextPlayerScheduledAt: null,
+                        lastResolvedPlayerId: null,
+                        lastResolvedStatus: null
+                    });
                 });
-                await batch.commit();
                 success = true;
             }
         } catch (err) { handleError(err.message); }
@@ -202,7 +262,7 @@ export const AuctionController = () => {
         try {
             const batch = writeBatch(db);
             if (auctionState.currentPlayerId) {
-                batch.update(doc(db, 'players', auctionState.currentPlayerId), { status: 'UPCOMING' });
+                batch.update(doc(db, 'players', auctionState.currentPlayerId), { status: 'READY' });
             }
             batch.update(doc(db, 'players', auctionState.lastPlayerId), { status: 'LIVE', teamId: null, soldPrice: 0 });
 
@@ -212,7 +272,11 @@ export const AuctionController = () => {
                 currentBid: 0,
                 leadingTeamId: null,
                 resolvedForPlayer: null,
-                status: 'PAUSED'
+                status: 'PAUSED',
+                nextPlayerScheduledAt: null,
+                lastResolvedPlayerId: null,
+                lastResolvedStatus: null,
+                lastResolvedAt: null
             });
             await batch.commit();
         } catch (err) { handleError(err.message); }
@@ -230,27 +294,38 @@ export const AuctionController = () => {
                 soldPrice: 0
             });
 
-            const qUp = query(collection(db, 'players'), where('status', '==', 'UPCOMING'), orderBy('createdAt', 'asc'), limit(1));
+            const qUp = query(collection(db, 'players'), where('status', 'in', ['READY', 'UNSOLD']));
             const upSnap = await getDocs(qUp);
 
             if (!upSnap.empty) {
-                const nextDoc = upSnap.docs[0];
-                batch.update(doc(db, 'players', nextDoc.id), { status: 'LIVE' });
+                const players = upSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                const randomIndex = Math.floor(Math.random() * players.length);
+                const selectedPlayer = players[randomIndex];
+
+                batch.update(doc(db, 'players', selectedPlayer.id), { status: 'LIVE' });
                 batch.update(auctionRef, {
-                    currentPlayerId: nextDoc.id,
-                    currentBid: nextDoc.data().basePrice || 0,
+                    currentPlayerId: selectedPlayer.id,
+                    currentBid: selectedPlayer.basePrice || 0,
                     leadingTeamId: null,
                     resolvedForPlayer: null,
                     timerStartedAt: serverTimestamp(),
                     timerDuration: 30000,
-                    status: 'LIVE'
+                    status: 'LIVE',
+                    nextPlayerScheduledAt: null,
+                    lastResolvedPlayerId: null,
+                    lastResolvedStatus: null,
+                    lastResolvedAt: null
                 });
             } else {
                 batch.update(auctionRef, {
                     status: 'ENDED',
                     currentPlayerId: null,
                     leadingTeamId: null,
-                    currentBid: 0
+                    currentBid: 0,
+                    nextPlayerScheduledAt: null,
+                    lastResolvedPlayerId: null,
+                    lastResolvedStatus: null,
+                    lastResolvedAt: null
                 });
             }
             await batch.commit();
@@ -273,7 +348,11 @@ export const AuctionController = () => {
                 leadingTeamId: null,
                 resolvedForPlayer: null,
                 timerStartedAt: serverTimestamp(),
-                timerDuration: 30000
+                timerDuration: 30000,
+                nextPlayerScheduledAt: null,
+                lastResolvedPlayerId: null,
+                lastResolvedStatus: null,
+                lastResolvedAt: null
             });
             await batch.commit();
         } catch (err) { handleError(err.message); }
@@ -305,27 +384,38 @@ export const AuctionController = () => {
                 });
             }
 
-            const qUp = query(collection(db, 'players'), where('status', '==', 'UPCOMING'), orderBy('createdAt', 'asc'), limit(1));
+            const qUp = query(collection(db, 'players'), where('status', 'in', ['READY', 'UNSOLD']));
             const upSnap = await getDocs(qUp);
 
             if (!upSnap.empty) {
-                const nextDoc = upSnap.docs[0];
-                batch.update(doc(db, 'players', nextDoc.id), { status: 'LIVE' });
+                const players = upSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                const randomIndex = Math.floor(Math.random() * players.length);
+                const selectedPlayer = players[randomIndex];
+
+                batch.update(doc(db, 'players', selectedPlayer.id), { status: 'LIVE' });
                 batch.update(auctionRef, {
-                    currentPlayerId: nextDoc.id,
-                    currentBid: nextDoc.data().basePrice || 0,
+                    currentPlayerId: selectedPlayer.id,
+                    currentBid: selectedPlayer.basePrice || 0,
                     leadingTeamId: null,
                     resolvedForPlayer: null,
                     timerStartedAt: serverTimestamp(),
                     timerDuration: 30000,
-                    status: 'LIVE'
+                    status: 'LIVE',
+                    nextPlayerScheduledAt: null,
+                    lastResolvedPlayerId: null,
+                    lastResolvedStatus: null,
+                    lastResolvedAt: null
                 });
             } else {
                 batch.update(auctionRef, {
                     status: 'ENDED',
                     currentPlayerId: null,
                     leadingTeamId: null,
-                    currentBid: 0
+                    currentBid: 0,
+                    nextPlayerScheduledAt: null,
+                    lastResolvedPlayerId: null,
+                    lastResolvedStatus: null,
+                    lastResolvedAt: null
                 });
             }
 
@@ -389,7 +479,11 @@ export const AuctionController = () => {
                 leadingTeamId: null,
                 resolvedForPlayer: null,
                 timerStartedAt: serverTimestamp(),
-                timerDuration: 30000
+                timerDuration: 30000,
+                nextPlayerScheduledAt: null,
+                lastResolvedPlayerId: null,
+                lastResolvedStatus: null,
+                lastResolvedAt: null
             });
 
             await batch.commit();
@@ -424,7 +518,11 @@ export const AuctionController = () => {
                 currentBid: 0,
                 leadingTeamId: null,
                 resolvedForPlayer: null,
-                roundNumber: 1
+                roundNumber: 1,
+                nextPlayerScheduledAt: null,
+                lastResolvedPlayerId: null,
+                lastResolvedStatus: null,
+                lastResolvedAt: null
             });
             await batch.commit();
             setShowFullReset(false);
@@ -455,7 +553,7 @@ export const AuctionController = () => {
                                     <div className="w-12 h-12 rounded-full bg-gray-800 flex items-center justify-center border-2 border-gray-700"><User className="text-gray-500" size={24} /></div>
                                 )}
                                 <div className="min-w-0">
-                                    <p className="font-black text-white text-lg leading-tight uppercase tracking-wide truncate">{currentPlayer.name}</p>
+                                    <p className="font-black text-white text-lg leading-tight uppercase tracking-wide text-wrap-fix clamp-2">{currentPlayer.name}</p>
                                     <p className="text-gray-400 text-[10px] font-bold tracking-widest uppercase mt-0.5 truncate">{currentPlayer.playingRole || 'Player'} • Base: ₹{(Number(currentPlayer.basePrice) || 0).toLocaleString()}</p>
                                 </div>
                             </>
@@ -472,8 +570,8 @@ export const AuctionController = () => {
                     <p className="text-gray-500 uppercase font-bold text-[10px] tracking-widest mb-2">Timer</p>
                     {isLive && timeLeft !== null ? (
                         <div className={`flex items-center space-x-2 px-4 py-2 rounded-lg border ${timeLeft <= 10
-                                ? 'bg-red-500/10 border-red-500/30'
-                                : 'bg-gray-900 border-gray-700'
+                            ? 'bg-red-500/10 border-red-500/30'
+                            : 'bg-gray-900 border-gray-700'
                             }`}>
                             <Clock size={20} className={timeLeft <= 10 ? 'text-red-400 animate-pulse' : 'text-brand-neon'} />
                             <span className={`text-3xl font-black tracking-tighter tabular-nums ${timeLeft <= 10 ? 'text-red-400' : 'text-white'}`}>
@@ -516,8 +614,8 @@ export const AuctionController = () => {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                 <button
                     onClick={() => updateStatus('LIVE')}
-                    disabled={loading || isLive}
-                    className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all ${!isLive && !loading ? 'bg-brand-neon/10 border-brand-neon/30 text-brand-neon hover:bg-brand-neon hover:text-black shadow-lg shadow-brand-neon/5' : 'bg-gray-900 border-gray-800 text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed'
+                    disabled={loading || isLive || isResolvedWaiting}
+                    className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all ${!isLive && !isResolvedWaiting && !loading ? 'bg-brand-neon/10 border-brand-neon/30 text-brand-neon hover:bg-brand-neon hover:text-black shadow-lg shadow-brand-neon/5' : 'bg-gray-900 border-gray-800 text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed'
                         }`}
                 >
                     <Play size={24} className="mb-1" />
@@ -526,7 +624,7 @@ export const AuctionController = () => {
 
                 <button
                     onClick={() => updateStatus('PAUSED')}
-                    disabled={loading || !isLive}
+                    disabled={loading || (!isLive && !isResolvedWaiting)}
                     className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all ${isLive && !loading ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-500 hover:bg-yellow-500 hover:text-black shadow-lg shadow-yellow-500/5' : 'bg-gray-900 border-gray-800 text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed'
                         }`}
                 >
@@ -546,8 +644,8 @@ export const AuctionController = () => {
 
                 <button
                     onClick={() => nextPlayer(true)}
-                    disabled={loading || !isLive}
-                    className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all ${isLive && !loading ? 'bg-blue-500/10 border-blue-500/30 text-blue-500 hover:bg-blue-500 hover:text-white shadow-lg shadow-blue-500/5' : 'bg-gray-900 border-gray-800 text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed'
+                    disabled={loading || (!isLive && !isResolvedWaiting)}
+                    className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all ${(isLive || isResolvedWaiting) && !loading ? 'bg-blue-500/10 border-blue-500/30 text-blue-500 hover:bg-blue-500 hover:text-white shadow-lg shadow-blue-500/5' : 'bg-gray-900 border-gray-800 text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed'
                         }`}
                 >
                     <FastForward size={24} className="mb-1" />
@@ -609,35 +707,9 @@ export const AuctionController = () => {
                 </button>
             </div>
 
-            {/* Danger Zone */}
-            <div className="mt-8 p-4 border border-red-900/50 bg-red-900/10 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-4">
-                <div className="text-center sm:text-left">
-                    <p className="text-red-500 font-bold uppercase tracking-widest text-[10px] flex items-center justify-center sm:justify-start"><AlertTriangle size={14} className="mr-1.5" /> Danger Zone</p>
-                    <p className="text-gray-400 text-xs mt-1">These actions reset auction progress and states. Proceed with caution.</p>
-                </div>
-                <div className="flex gap-3 w-full sm:w-auto">
-                    <button onClick={() => setShowDemoReset(true)} className="flex-1 sm:flex-none px-4 py-2.5 bg-red-800/10 text-red-500 hover:bg-red-800/20 hover:text-white font-bold uppercase text-[10px] tracking-wider rounded border border-red-900/50 transition disabled:opacity-50">Demo Reset</button>
-                    <button onClick={() => setShowFullReset(true)} className="flex-1 sm:flex-none px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white font-black uppercase text-[10px] tracking-wider rounded transition shadow-lg shadow-red-900/50 disabled:opacity-50">Full Reset</button>
-                </div>
-            </div>
 
-            {/* -------- MODALS -------- */}
 
-            <Modal title="Confirm Demo Reset" show={showDemoReset} onClose={() => setShowDemoReset(false)}>
-                <p className="text-gray-300 font-medium mb-6 text-sm">This will reset all player statuses to <span className="font-bold text-white uppercase">UNSOLD</span> and clear sold prices, but keeps the auction alive and running. Teams and Base prices are not deleted. Continue?</p>
-                <div className="flex gap-4">
-                    <button onClick={() => setShowDemoReset(false)} className="flex-1 py-3 bg-gray-800 text-white rounded font-bold uppercase tracking-widest text-xs hover:bg-gray-700 transition">Cancel</button>
-                    <button onClick={handleDemoReset} disabled={loading} className="flex-1 py-3 bg-red-600 text-white rounded font-black uppercase tracking-widest text-xs transition hover:bg-red-500 shadow-lg shadow-red-900/30">Reset Players</button>
-                </div>
-            </Modal>
 
-            <Modal title="Confirm Full Reset" show={showFullReset} onClose={() => setShowFullReset(false)}>
-                <p className="text-gray-300 font-medium mb-6 text-sm">This will clear ALL auction results, set all players to <span className="font-bold text-white uppercase">UNSOLD</span>, and transition system to <span className="font-bold text-white uppercase">NOT_STARTED</span>. Continue?</p>
-                <div className="flex gap-4">
-                    <button onClick={() => setShowFullReset(false)} className="flex-1 py-3 bg-gray-800 text-white rounded font-bold uppercase tracking-widest text-xs hover:bg-gray-700 transition">Cancel</button>
-                    <button onClick={handleFullReset} disabled={loading} className="flex-1 py-3 bg-red-600 text-white rounded font-black uppercase tracking-widest text-xs transition hover:bg-red-500 shadow-lg shadow-red-900/30">Confirm Reset</button>
-                </div>
-            </Modal>
 
             <Modal title="Force Assign Player" show={showAssign} onClose={() => setShowAssign(false)}>
                 <div className="space-y-4 mb-6">
